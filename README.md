@@ -35,7 +35,7 @@ In this, project, the following modifications were made to the above formulation
 1. Clone the project: Run this from the command line
  
  ```commandline
- git clone git@github.com:graphshade/zeno_convex.git
+ git clone https://github.com/graphshade/safety_stock_simulation.git
  ```
  
 2. Change directory to safety_stock_simulation, create an virtual environment and install the dependencies.
