@@ -1,44 +1,34 @@
-#safety Stock
+# Using Gaussian Kernel Density Estimation to Simulate Safety Stock
 
-![](https://i.imgur.com/SKksFxz.png)
+![](https://i.imgur.com/FaWOaYJ.png)
 
 <h2>Description</h2>
 
-Zeno is a conversational AI chatbot for businesses interact with theirdata. Zeno is designed to help you discover, explore, and manage your business reports with ease, empowering you to make data-driven decisions faster than ever before.
+The typical formula for safety stock is given as $= Z_\sigma \sigma_d \sqrt{L + R}$	
 
-LLM Chatbot built using Next.js for front-end and backend-end and a self-hosted convex database
+where $= Z_\sigma$ is the inverse CDF, $\sigma_d$ is the standard deviation of demand, $L + R$ i sthe Lead time and Review period
 
-Features:
-1. LLM Chat interface
-2. Retrieval Augmented Generation
-3. Authentication
-4. About page
-5. Reports page
-6. Additional feature requests page
+some notable limitations when applying this formulation to real-world situations are as follows
+1. demand is not normally distributed and mostly discrete
+2. demand is historical and not forward looking
+3. the  $= Z_\sigma$ is dependent on picking an arbitrary service level, but may not be optimal
+
+In this, project, the following modifications were made to the above formulation to minimize the limitations when applying to real-world scenario
+1. model demand using a custom gaussian kernel density estimation and transform the resulting distribution to a discrete distribution
+2. use forecasted demand if available
+3. run simulations over different service levels say 70% to 99% and different review periods say 1 week to 4 weeks
+4. optional: use linear programming to pick the safety stock setting that minimizes inventory holding cost
 
 
 <h2>Programming Language</h2>
 
-- Typescript & Javascript
-- Html & CSS
-
-<h2>Tech stack and CI/CD</h2>
-
-- Next.js
-- LangChain.js
-- ConvexDB
-- React.js
-- Shadcn
-- Zod
-- Docker
-- Ngnix
-- Git
+- Python
 
 <h2>Environment Used </h2>
 
 - <b>Ubuntu</b>
 
-<h2>Run manually:</h2>
+<h2>To reproduce:</h2>
 
 <p align="left">
  
@@ -48,63 +38,16 @@ Features:
  git clone git@github.com:graphshade/zeno_convex.git
  ```
  
-2. Change directory to zeno_convex and install the dependencies.
+2. Change directory to safety_stock_simulation, create an virtual environment and install the dependencies.
    
 ```commandline
- cd zeno_convex
- npm install
+ pip install -r requirements.txt
  ```
 
-3. Set up the convex database. Follow instructions here to [self-host convex](https://stack.convex.dev/self-hosted-develop-and-deploy).
- 
-4. Update environment variables in .env.local file if needed
-
-5. Update/generate the convex functions and run development server
-   
+3. update the main.py file to input needed data and run the main.py file
 ```commandline
-npx convex dev
-npm run dev
- ```
+python main.py
+ ``` 
 
 
-<h2>Run with Docker:</h2>
-
-<p align="left">
- 
-1. Clone the project: Run this from the command line
- 
- ```commandline
- git clone git@github.com:graphshade/zeno_convex.git
- ```
- 
-2. Change directory to zeno_convex.
-   
-```commandline
- cd zeno_convex
- ```
-
-3. Set up the convex database. Follow instructions here to [self-host convex](https://stack.convex.dev/self-hosted-develop-and-deploy).
- 
-4. Update environment variables in .env.local file if needed
-
-5. Build docker image
-   
-```commandline
-docker build -t zeno_convex $(xargs < .env.local echo -n --build-arg ) 
- ```
- 
-6. Run docker container
-
-```commandline
-docker run --env-file .env.local -p 3000:3000 zeno_convex
- ```
-
-<h2>More Images </h2>
-
-<p float="left">
-  <img src="https://i.imgur.com/f9xxfki.png" width="500" />
-  <img src="https://i.imgur.com/JFmmi7E.png" width="500" /> 
-  <img src="https://i.imgur.com/Mx9hrXJ.png" width="500" />
-  <img src="https://i.imgur.com/a5L6Sr6.png" width="500" />
-</p>
 
