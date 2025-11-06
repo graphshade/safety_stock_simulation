@@ -8,45 +8,51 @@ import glob
 pd.options.mode.chained_assignment = None
 
 
-def fit_discrete_kde(d_x):
+def fit_discrete_kde(d_x, bw_method='scott', cut=3, support_min=0):
     """
-    Takes numpy array or pandas series, of demand and returns numpy array of discrete distribution following Gaussian KDE
-
-    Parameters:
-    d_x (numpy array or pandas series): periodic demand data (weekly, monthly etc)
-
-    Returns:
-    tuple: tuple of (x:discrete demand series, pmf: corresponding probability mass function)
+    Fit Gaussian KDE to data d_x, evaluate on integer grid, and return a discrete PMF.
+    Probability mass below `support_min` is merged into the first valid bin.
     """
-    #fit continous gaussian kernel density with scott bandwidth
-    kde_dist = stats.gaussian_kde(d_x, bw_method='scott')
+    d_x = np.asarray(d_x, dtype=float)
 
-    #compute bandwith for upper and lower intervals for discrete distribution
-    bandwidth = np.std(d_x, ddof=0) / (len(d_x)**(1/5))
+    # KDE
+    kde = stats.gaussian_kde(d_x, bw_method=bw_method)
 
-    #set upper and lower intervals with a heuristic of 3 * bandwidth
-    lower = np.floor(np.min(d_x) - 3 * bandwidth) 
-    upper = np.ceil(np.max(d_x) + 3 * bandwidth)
+    # Bandwidth and range (inclusive)
+    bandwidth = kde.factor * np.std(d_x, ddof=1)
+    lower = int(np.floor(d_x.min() - cut * bandwidth))
+    upper = int(np.ceil(d_x.max() + cut * bandwidth))
+    if upper < lower:
+        lower, upper = upper, lower
+    x = np.arange(lower, upper + 1, dtype=int)
 
-    #range of discrete values from lower to upper intervals
-    x = np.arange(lower,upper,step=1)
+    # Evaluate and normalize to PMF (Δx = 1)
+    pdf_vals = kde.pdf(x.astype(float))
+    total = pdf_vals.sum()
+    if total == 0:
+        # Degenerate fallback: put all mass at nearest integer to mean
+        xi = int(np.rint(d_x.mean()))
+        return np.array([xi], dtype=int), np.array([1.0], dtype=float)
+    pmf = pdf_vals / total
 
-    #get probability densities given for x
-    pmf = kde_dist.pdf(x) 
+    # Truncate below support_min and merge spill into first valid bin
+    if support_min is not None:
+        mask = x >= support_min
+        if not mask.any():
+            # Everything is below support_min → put all mass at support_min
+            return np.array([int(support_min)], dtype=int), np.array([1.0], dtype=float)
 
-    #scale the pmf to equal to 1
-    pmf = pmf/sum(pmf)
+        spill = pmf[~mask].sum()
+        first_idx = np.where(mask)[0][0]          # index in original arrays
+        pmf[first_idx] += spill                   # add to original pmf
+        # Now actually truncate arrays
+        pmf = pmf[mask]
+        x = x[mask]
 
-    ### deal with negative PMFs
-    zero = x == 0 
-    negative = x < 0 
-    #Update the PMF at 0 
-    pmf[zero] = pmf[zero] + pmf[negative].sum() 
-    #Remove negative values 
-    zero_arg = np.argmax(x==0) 
-    pmf = pmf[zero_arg:] 
-    x = x[zero_arg:].astype(int)
-    return x, pmf
+    # Final renormalization (protect against FP drift)
+    pmf = pmf / pmf.sum()
+
+    return x.astype(int), pmf
 
 ### function to get distribution attributes
 
@@ -68,63 +74,204 @@ def attributes(pmf,x):
 
 
 ### Safety Stock Over Risk Period (L + R): Fitting Gaussian Kernel Density, simulation
-def simulate_safety_custom(d_x, d_pmf, L=4, R=1, alpha=0.95, time=200,pu_price = None):
+def simulate_safety_custom(
+    d_x, d_pmf, L=4, R=1, alpha=0.95, time=200, pu_price=None, holding_rate=1, seed=111
+):
     """
-    Performs K timestep simulation over a given review period and lead time, Risk Period (L + R), 
-    to set safety stock and evaluate Safety Stock metrics like achieved service level alpha, period service level alpha etc
+    Simulate inventory performance under stochastic demand using an empirical 
+    safety stock estimate derived from a discrete demand distribution.
 
-    Parameters:
-    d_x (numpy array): discrete demand
-    d_pmf (numpy array): corresponding probability mass function
-    L (int): Lead time (in weeks). Default is 4 weeks
-    R (int): Review period. Default is 1 week
-    alpha (float): desired service level. Default of 95%
-    time (int): K number of time steps to run simulation. Default is 200
-    pu_price (float): per unit price of item. Default is None
+    Parameters
+    ----------
+    d_x : array-like
+        Discrete demand values (support of the demand distribution).
+    d_pmf : array-like
+        Probability mass function corresponding to `d_x`.
+    L : int, default=4
+        Lead time (in periods) for replenishment.
+    R : int, default=1
+        Review period (in periods) between orders.
+    alpha : float, default=0.95
+        Service level target (quantile for empirical safety stock computation).
+    time : int, default=200
+        Number of simulation periods.
+    pu_price : float, optional
+        Unit purchase price used to estimate the holding cost value of safety stock.
+    holding_rate : float, default=1
+        Holding cost rate applied to the safety stock value.
+    seed : int, default=111
+        Random seed for reproducibility.
 
-    Returns:
-    tuple: tuple of (alpha: desired service level, SL_alpha: achieved service level from simulation, Ss: safety stock, S_value: safety stock value)
+    Returns
+    -------
+    tuple
+        (target_service_level, simulated_cycle_service_level, 
+         simulated_period_service_level, safety_stock_units, safety_stock_value)
+         
+        where:
+        - target_service_level : float — target α service level (in percentage).
+        - simulated_cycle_service_level : float — achieved service level per cycle.
+        - simulated_period_service_level : float — achieved service level per period.
+        - safety_stock_units : int — computed empirical safety stock quantity.
+        - safety_stock_value : float — cost value of safety stock.
+
+    Notes
+    -----
+    - The empirical safety stock is estimated as the α-quantile of the total demand 
+      over the combined lead and review period minus its mean.
+    - The simulation tracks on-hand and in-transit inventories and identifies 
+      stockout events across periods and cycles.
+    - A DataFrame of inventory trajectories is generated internally but not returned.
+
     """
+    if seed:
+        np.random.seed(seed)
+        
+    # --- Demand distribution attributes ---
     d_mu, d_std = attributes(d_pmf, d_x)
-    d = random_values = np.random.choice(d_x, size=time, p=d_pmf)
+    # print(f"mean: {d_mu} and std: {d_std}")
+    d = np.random.choice(d_x, size=time, p=d_pmf)
+    # print(f"demand: {d}")
+    # --- Empirical safety stock based on KDE quantile ---
+    period_demand_samples = np.random.choice(d_x, size=(1000, L+R), p=d_pmf)
+    # print(f"sample: {period_demand_samples}")
+    total_demand_LR = np.sum(period_demand_samples, axis=1)
+    ss_empirical = np.quantile(total_demand_LR, alpha) - np.mean(total_demand_LR)
+    ss_empirical = max(0.0, ss_empirical)
+    Ss = np.round(ss_empirical).astype(int)
+    # print(f"total_demand: {total_demand_LR}, ss_empirical: {ss_empirical}, ss: {Ss}")
+
+    # --- Stock components ---
+    Cs = 0.5 * d_mu * R
+    Is = d_mu * L
+    S = Ss + 2*Cs + Is
+
+    # --- Cost impact ---
+    S_value = round(pu_price * holding_rate * Ss,4) if pu_price else 0.0000
+
+    # --- Inventory simulation ---
+    hand = np.zeros(time)
+    transit = np.zeros((time, L+1))
+    stockout_period = np.full(time, False, dtype=bool)
+    stockout_cycle = []
+
+    hand[0] = S - d[0]
+    transit[0, -1] = d[0]
+
+    for t in range(1, time):
+        if transit[t-1, 0] > 0:
+            stockout_cycle.append(stockout_period[t-1])
+        hand[t] = hand[t-1] - d[t] + transit[t-1, 0]
+        stockout_period[t] = hand[t] < 0
+        hand[t] = max(0, hand[t])
+        transit[t, :-1] = transit[t-1, 1:]
+        if t % R == 0:
+            net = hand[t] + transit[t].sum()
+            transit[t, L] = S - net
+
+    df = pd.DataFrame({'Demand': d, 'On-hand': hand, 'In-transit': list(transit)})
+    df = df.iloc[L+R:, :]
+
+    # SL_cycle = round((1 - np.mean(stockout_cycle)) * 100, 1)
+    # SL_period = round((1 - np.mean(stockout_period)) * 100, 1)
+    SL_cycle = round((1 - np.mean(stockout_cycle)), 4)
+    SL_period = round((1 - np.mean(stockout_period)), 4)
+    
+    return round(alpha * 100, 1), SL_cycle, SL_period, Ss, S_value
+
+
+def simulate_safety_custom_norm(
+    d_mu, d_std, L=4, R=1, alpha=0.95, time=200, pu_price=None, holding_rate=1, seed=111
+):
+    """
+    Simulate inventory performance using a normal demand distribution and 
+    compute safety stock based on the normal quantile method.
+
+    Parameters
+    ----------
+    d_mu : float
+        Mean of the normal demand distribution.
+    d_std : float
+        Standard deviation of the normal demand distribution.
+    L : int, default=4
+        Lead time (in periods) for replenishment.
+    R : int, default=1
+        Review period (in periods) between orders.
+    alpha : float, default=0.95
+        Target service level (used for safety stock quantile).
+    time : int, default=200
+        Number of simulation periods.
+    pu_price : float, optional
+        Unit price for estimating holding cost value of safety stock.
+    holding_rate : float, default=1
+        Holding cost rate applied to the safety stock.
+    seed : int, default=111
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    tuple
+        (target_service_level, simulated_cycle_service_level, 
+         simulated_period_service_level, safety_stock_units, safety_stock_value)
+         
+        where:
+        - target_service_level : float — target α service level (in percentage).
+        - simulated_cycle_service_level : float — achieved service level per cycle.
+        - simulated_period_service_level : float — achieved service level per period.
+        - safety_stock_units : int — computed safety stock quantity.
+        - safety_stock_value : float — estimated cost of safety stock.
+
+    Notes
+    -----
+    - Demand is generated from a normal distribution truncated at zero.
+    - Safety stock is computed as z * σ√(L+R), where z is the α-quantile.
+    - The simulation tracks on-hand, in-transit inventory, and stockouts.
+    """
+    if seed:
+        np.random.seed(seed)
+        
+    d = np.maximum(np.random.normal(d_mu,d_std,time).round(0).astype(int),0)
     z = stats.norm.ppf(alpha)
     if z < 0:
         z = 0.0
     x_std = np.sqrt(L+R)*d_std
     Ss = np.round(x_std*z).astype(int)
+    Ss = max(0.0, Ss)
     Cs = 1/2 * d_mu * R
     Is = d_mu * L
     S = Ss + 2*Cs + Is
-    if pu_price:
-        S_value = pu_price*0.05*Ss
-    else:
-        S_value = 0
+
+    # --- Cost impact ---
+    S_value = round(pu_price * holding_rate * Ss,4) if pu_price else 0
+
+    # --- Inventory simulation ---
     hand = np.zeros(time)
-    transit = np.zeros((time,L+1))
-    hand[0] = S - d[0]
-    transit[0,-1] = d[0]
-    stockout_period = np.full(time,False,dtype=bool)
+    transit = np.zeros((time, L+1))
+    stockout_period = np.full(time, False, dtype=bool)
     stockout_cycle = []
-    for t in range(1,time):
-        if transit[t-1,0]>0:
+
+    hand[0] = S - d[0]
+    transit[0, -1] = d[0]
+
+    for t in range(1, time):
+        if transit[t-1, 0] > 0:
             stockout_cycle.append(stockout_period[t-1])
-        hand[t] = hand[t-1] - d[t] + transit[t-1,0]
+        hand[t] = hand[t-1] - d[t] + transit[t-1, 0]
         stockout_period[t] = hand[t] < 0
-        hand[t] = max(0,hand[t]) #Uncomment if excess demand result in lost sales rather than backorders
-        transit[t,:-1] = transit[t-1,1:]
-        if 0==t%R:
+        hand[t] = max(0, hand[t])
+        transit[t, :-1] = transit[t-1, 1:]
+        if t % R == 0:
             net = hand[t] + transit[t].sum()
-            transit[t,L] = S - net
-    df = pd.DataFrame(data= {'Demand':d,'On-hand':hand,'In-transit':list(transit)})
-    df = df.iloc[R+L:,:] #Remove initialization periods
-    alpha = round(alpha * 100,1)
-    if len(stockout_cycle) != 0:
-        SL_alpha = round((1-sum(stockout_cycle)/len(stockout_cycle))*100,1)
-    else:
-        SL_alpha = round((1-sum(stockout_cycle))*100,1)
-    if len(stockout_period) != 0:
-        SL_period = round((1-sum(stockout_period)/time)*100,1)
-    else:
-        SL_period = round((1-sum(stockout_period))*100,1)
-    return alpha, SL_alpha, SL_period,Ss, S_value
+            transit[t, L] = S - net
+
+    df = pd.DataFrame({'Demand': d, 'On-hand': hand, 'In-transit': list(transit)})
+    df = df.iloc[L+R:, :]
+
+    # SL_cycle = round((1 - np.mean(stockout_cycle)) * 100, 1)
+    # SL_period = round((1 - np.mean(stockout_period)) * 100, 1)
+    SL_cycle = round((1 - np.mean(stockout_cycle)), 4)
+    SL_period = round((1 - np.mean(stockout_period)), 4)
+    
+    return round(alpha * 100, 1), SL_cycle, SL_period, Ss, S_value
+    
 
